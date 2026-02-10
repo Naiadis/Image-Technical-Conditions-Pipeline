@@ -1,1 +1,1 @@
-# Thesis-Mock
+# Image-tech-conditions
