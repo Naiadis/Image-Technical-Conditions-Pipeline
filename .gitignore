@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific data (thesis images and outputs)
+# NOTE: This keeps your local test/real images OUT of git.
+# We can later add a small separate folder for tiny example images to commit if needed.
+data/input/
+data/output/
