@@ -43,6 +43,9 @@ What this script does so far:
 3. Saves all measurements into a CSV file (open in Excel / SPSS).
 
 Later steps =') : MAD-based outlier flagging (Shimizu Y, 2022), image transformation, z-scoring.
+To do: - Write the exact version of the libraries used in the script (freezing dependencies).
+    - Feature quality checks (e.g. saturation texture is always 0, or i get a weird value for colorfulness).
+    - check for things like "double files", coroupt files, etc.
 """
 
 import os
@@ -202,12 +205,6 @@ def compute_all_features_for_image(image_bgr: np.ndarray, image_path: str) -> Di
 
 
 def process_all_images(input_dir: str) -> pd.DataFrame:
-    """
-    Main helper that:
-    1. Finds all images in the input folder.
-    2. Computes all 17 features for each image.
-    3. Returns a pandas DataFrame with one row per image.
-    """
     image_paths = list_image_files(input_dir)
 
     if not image_paths:
@@ -238,10 +235,6 @@ def process_all_images(input_dir: str) -> pd.DataFrame:
 
 
 def main() -> None:
-    """
-    Entry point of the script.
-    This is what runs when you call:  python image_pipeline.py
-    """
     print("=== Image feature extraction (all 17 features) ===")
     print(f"Looking for images in: {INPUT_DIR}")
 
@@ -253,7 +246,7 @@ def main() -> None:
         print("No data to save (no images were found or processed).")
         return
 
-    # Save the results to a CSV file so you can open it in Excel / SPSS.
+    # Save the results to a CSV file so it can be opened in Excel / SPSS.
     df.to_csv(CSV_OUTPUT_PATH, index=False)
 
     print(f"\nDone. Saved {len(df)} rows (one per image) to:")
