@@ -31,6 +31,12 @@ Libraries used during implementation.
     - graycoprops:
       https://scikit-image.org/docs/stable/api/skimage.feature.html#skimage.feature.graycoprops
 
+  Outlier detection (MAD method):
+    Shimizu Y (2022) Multiple Desirable Methods in Outlier Detection of Univariate
+    Data With R Source Codes. Front. Psychol. 12:819854.
+    doi: 10.3389/fpsyg.2021.819854
+    https://pmc.ncbi.nlm.nih.gov/articles/PMC8801745/
+
 
 What this script does so far:
 1. Looks in a folder for images (jpg, jpeg, png).
@@ -42,7 +48,7 @@ What this script does so far:
    - Composition: Height, Width, Sum of Height and Width
 3. Saves all measurements into a CSV file (open in Excel / SPSS).
 
-Later steps =') : MAD-based outlier flagging (Shimizu Y, 2022), image transformation, z-scoring.
+Later steps ='): image transformation, z-scoring maybe.
 To do: - Write the exact version of the libraries used in the script (freezing dependencies).
     - Feature quality checks (e.g. saturation texture is always 0, or i get a weird value for colorfulness).
     - check for things like "double files", coroupt files, etc.
@@ -68,6 +74,7 @@ INPUT_DIR = "data/input"
 OUTPUT_DIR = "data/output"
 
 CSV_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "image_features_all.csv")
+OUTLIER_REPORT_PATH = os.path.join(OUTPUT_DIR, "outlier_report.csv")
 
 def ensure_output_folder_exists() -> None:
 
@@ -234,8 +241,42 @@ def process_all_images(input_dir: str) -> pd.DataFrame:
     return df
 
 
+def _compute_mad(x: np.ndarray) -> float:
+    # Median Absolute Deviation [MAD = 1.4826 × Med(|x - Med(x)|)].
+    med = np.median(x)
+    raw_mad = np.median(np.abs(x - med))
+    return 1.4826 * raw_mad
+
+
+def flag_mad_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    # Flag images whose feature values fall outside median ± 2.5 × MAD.
+    numeric_cols = [c for c in df.columns if c != "filename"]
+    rows = []
+    for feat in numeric_cols:
+        vals = df[feat].values
+        median = np.median(vals)
+        mad = _compute_mad(vals)
+        k = 2.5
+        lower = median - k * mad
+        upper = median + k * mad
+        for i, fn in enumerate(df["filename"]):
+            v = vals[i]
+            out = v < lower or v > upper
+            rows.append({
+                "filename": fn,
+                "feature": feat,
+                "value": v,
+                "median": median,
+                "mad": mad,
+                "lower_bound": lower,
+                "upper_bound": upper,
+                "is_outlier": out,
+            })
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
-    print("=== Image feature extraction (all 17 features) ===")
+    print("Image feature extraction (all 17 features)")
     print(f"Looking for images in: {INPUT_DIR}")
 
     ensure_output_folder_exists()
@@ -246,12 +287,19 @@ def main() -> None:
         print("No data to save (no images were found or processed).")
         return
 
-    # Save the results to a CSV file so it can be opened in Excel / SPSS.
+    # Save features to CSV
     df.to_csv(CSV_OUTPUT_PATH, index=False)
+    print(f"\nSaved {len(df)} rows to: {CSV_OUTPUT_PATH}")
 
-    print(f"\nDone. Saved {len(df)} rows (one per image) to:")
-    print(f"  {CSV_OUTPUT_PATH}")
-    print("\nYou can open this CSV file in Excel, SPSS, etc.")
+    # Outlier flagging
+    print("\n Outlier detection")
+    outlier_df = flag_mad_outliers(df)
+    outlier_df.to_csv(OUTLIER_REPORT_PATH, index=False)
+    print(f"Outlier report saved to: {OUTLIER_REPORT_PATH}")
+
+    # Summary: total outliers
+    n_outliers = outlier_df["is_outlier"].sum()
+    print(f"Total outlier values: {n_outliers}")
 
 
 if __name__ == "__main__":
