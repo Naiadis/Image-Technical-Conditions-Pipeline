@@ -57,6 +57,7 @@ To do: - Write the exact version of the libraries used in the script (freezing d
 """
 
 import os
+import shutil
 from typing import List, Dict, Any
 
 import cv2  # OpenCV for image processing
@@ -77,6 +78,8 @@ OUTPUT_DIR = "data/output"
 
 CSV_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "image_features_all.csv")
 OUTLIER_REPORT_PATH = os.path.join(OUTPUT_DIR, "outlier_report.csv")
+# After-adjustment features (for \"after\" comparison)
+CSV_AFTER_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "image_features_after.csv")
 
 # Folder where we will save resized copies of the images.
 # This keeps the original images untouched.
@@ -137,6 +140,19 @@ def ensure_adjusted_folder_exists() -> None:
     We keep adjusted copies separate so original images are not changed.
     """
 
+    os.makedirs(ADJUSTED_IMAGE_DIR, exist_ok=True)
+
+
+def reset_adjusted_folder() -> None:
+    """
+    Clear the adjusted images folder so each run starts from originals.
+    This avoids stacking the same adjustment multiple times across runs.
+    Within a single run, adjustments are still applied in sequence
+    (exposure, then contrast, then saturation).
+    """
+
+    if os.path.isdir(ADJUSTED_IMAGE_DIR):
+        shutil.rmtree(ADJUSTED_IMAGE_DIR)
     os.makedirs(ADJUSTED_IMAGE_DIR, exist_ok=True)
 
 
@@ -574,6 +590,176 @@ def adjust_exposure_from_plan(
             print(f"WARNING: Could not save adjusted image to: {save_path}")
 
 
+def _load_image_preferring_adjusted(filename: str) -> np.ndarray:
+    """
+    Helper: try to load the already adjusted version first,
+    otherwise fall back to the original in INPUT_DIR.
+    """
+
+    # Prefer the image from the adjusted folder if it exists (so that
+    # multiple adjustments stack on top of each other).
+    adjusted_path = os.path.join(ADJUSTED_IMAGE_DIR, filename)
+    if os.path.isfile(adjusted_path):
+        image = cv2.imread(adjusted_path)
+        if image is not None:
+            return image
+
+    # Fallback to the original input folder.
+    original_path = os.path.join(INPUT_DIR, filename)
+    return cv2.imread(original_path)
+
+
+def adjust_contrast_from_plan(
+    plan_df: pd.DataFrame,
+    output_dir: str,
+) -> None:
+    """
+    Apply simple contrast adjustments according to the plan.
+
+    For now we:
+    - Look only at rows where feature == "contrast".
+    - Scale pixel values around their channel means so that the
+      grayscale contrast (standard deviation) moves toward the
+      global target_mean for contrast.
+    - Save adjusted copies in output_dir, one per original image.
+    """
+
+    if plan_df is None or plan_df.empty:
+        print("\nNo adjustment plan available, skipping contrast adjustment.")
+        return
+
+    contrast_rows = plan_df[plan_df["feature"] == "contrast"]
+    if contrast_rows.empty:
+        print("\nNo contrast outliers in the adjustment plan, nothing to change.")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\nAdjusting contrast for {len(contrast_rows)} images.")
+
+    for _, row in contrast_rows.iterrows():
+        filename = row["filename"]
+        current_contrast = float(row["value"])
+        target_contrast = float(row["target_mean"])
+
+        image = _load_image_preferring_adjusted(filename)
+        if image is None:
+            print(f"WARNING: Could not read image for contrast adjustment: {filename}")
+            continue
+
+        # Work in grayscale to estimate current mean and contrast.
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        std_gray = float(gray.std())
+
+        if std_gray <= 0:
+            print(f"WARNING: Non-positive current contrast for {filename}, skipping.")
+            adjusted = image
+        else:
+            # Scale factor to move standard deviation toward the target.
+            scale = target_contrast / std_gray
+
+            # Apply the same scale to each BGR channel around its mean.
+            img_float = image.astype(np.float32)
+            # Compute per-channel means.
+            means = img_float.reshape(-1, 3).mean(axis=0)
+
+            # new = mean + scale * (old - mean)
+            adjusted = img_float - means
+            adjusted *= scale
+            adjusted += means
+            adjusted = np.clip(adjusted, 0, 255).astype(np.uint8)
+
+        save_path = os.path.join(output_dir, filename)
+        success = cv2.imwrite(save_path, adjusted)
+        if not success:
+            print(f"WARNING: Could not save contrast-adjusted image to: {save_path}")
+
+
+def adjust_saturation_from_plan(
+    plan_df: pd.DataFrame,
+    output_dir: str,
+) -> None:
+    """
+    Apply simple saturation (avg_sat) adjustments according to the plan.
+
+    - We look only at rows where feature == "avg_sat".
+    - We scale the S channel in HSV so that the mean saturation moves
+      toward the global target_mean for avg_sat.
+    - Adjustments are stacked on top of any previous exposure/contrast
+      changes by reading from the adjusted_images folder when possible.
+    """
+
+    if plan_df is None or plan_df.empty:
+        print("\nNo adjustment plan available, skipping saturation adjustment.")
+        return
+
+    sat_rows = plan_df[plan_df["feature"] == "avg_sat"]
+    if sat_rows.empty:
+        print("\nNo saturation outliers in the adjustment plan, nothing to change.")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\nAdjusting saturation for {len(sat_rows)} images.")
+
+    for _, row in sat_rows.iterrows():
+        filename = row["filename"]
+        current_sat = float(row["value"])
+        target_sat = float(row["target_mean"])
+
+        image = _load_image_preferring_adjusted(filename)
+        if image is None:
+            print(f"WARNING: Could not read image for saturation adjustment: {filename}")
+            continue
+
+        if current_sat <= 0:
+            print(f"WARNING: Non-positive current avg_sat for {filename}, skipping.")
+            adjusted_bgr = image
+        else:
+            # Convert to HSV to manipulate the S (saturation) channel.
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            h, s, v = cv2.split(hsv)
+
+            # Scale factor based on target vs current mean saturation.
+            scale = target_sat / current_sat
+            s_float = s.astype(np.float32) * scale
+            adjusted_s = np.clip(s_float, 0, 255).astype(np.uint8)
+
+            hsv_adjusted = cv2.merge([h, adjusted_s, v])
+            adjusted_bgr = cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2BGR)
+
+        save_path = os.path.join(output_dir, filename)
+        success = cv2.imwrite(save_path, adjusted_bgr)
+        if not success:
+            print(f"WARNING: Could not save saturation-adjusted image to: {save_path}")
+
+
+def measure_adjusted_images() -> None:
+    """
+    Re-measure all features on the adjusted images and save to a new CSV.
+
+    This gives us an \"after\" table (image_features_after.csv) that can be
+    compared to the original measurements to see how much the adjustments
+    reduced differences between images / conditions.
+    """
+
+    if not os.path.isdir(ADJUSTED_IMAGE_DIR):
+        print(f"\nNo adjusted image folder found at: {ADJUSTED_IMAGE_DIR}")
+        return
+
+    df_after = process_all_images(ADJUSTED_IMAGE_DIR)
+    if df_after.empty:
+        print("\nNo adjusted images were processed, skipping after-measurement.")
+        return
+
+    df_after.to_csv(CSV_AFTER_OUTPUT_PATH, index=False)
+    print(f"\nSaved adjusted-image features to: {CSV_AFTER_OUTPUT_PATH}")
+
+    # Quick summary for adjustable features after adjustment
+    print("\nFeature summary AFTER adjustment (adjusted images):")
+    print_feature_summary(df_after)
+
+
 def main() -> None:
     print("Image feature extraction (all 17 features)")
     print(f"Looking for images in: {INPUT_DIR}")
@@ -611,13 +797,33 @@ def main() -> None:
     # Build a simple adjustment plan for adjustable features based on MAD outliers.
     plan_df = build_adjustment_plan(df, outlier_df)
 
-    # Example: apply exposure adjustments only (brightness), using originals as input.
-    ensure_adjusted_folder_exists()
+    # Reset adjusted images folder so each run starts from the original images.
+    reset_adjusted_folder()
+
+    # Apply exposure adjustments first (brightness).
     adjust_exposure_from_plan(
         plan_df=plan_df,
         input_dir=INPUT_DIR,
         output_dir=ADJUSTED_IMAGE_DIR,
     )
+
+    # Then apply contrast adjustments, stacking on top of exposure changes
+    # (if any). Both adjustments are saved into the same adjusted_images folder.
+    adjust_contrast_from_plan(
+        plan_df=plan_df,
+        output_dir=ADJUSTED_IMAGE_DIR,
+    )
+
+    # Finally apply saturation adjustments (avg_sat), also stacking on top of
+    # any previous changes to create one final adjusted image per filename.
+    adjust_saturation_from_plan(
+        plan_df=plan_df,
+        output_dir=ADJUSTED_IMAGE_DIR,
+    )
+
+    # After all adjustments, re-measure features on the adjusted images
+    # so we have an \"after\" table for numeric comparison.
+    measure_adjusted_images()
 
 
 if __name__ == "__main__":
