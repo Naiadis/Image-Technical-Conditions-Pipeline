@@ -46,7 +46,9 @@ What this script does so far:
              Central H, Central S, Central V
    - Texture: Hue Texture, Saturation Texture
    - Composition: Height, Width, Sum of Height and Width
-3. Saves all measurements into a CSV file (open in Excel / SPSS).
+3. Saves results to image_features_all.csv (in case we want to open it in Excel / SPSS).
+4. Flags outliers using MAD method (Shimizu, 2022): values outside median ± 2.5 × MAD.
+5. Saves outlier report to outlier_report.csv.
 
 Later steps ='): image transformation, z-scoring maybe.
 To do: - Write the exact version of the libraries used in the script (freezing dependencies).
@@ -76,9 +78,66 @@ OUTPUT_DIR = "data/output"
 CSV_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "image_features_all.csv")
 OUTLIER_REPORT_PATH = os.path.join(OUTPUT_DIR, "outlier_report.csv")
 
+# Folder where we will save resized copies of the images.
+# This keeps the original images untouched.
+RESIZED_IMAGE_DIR = os.path.join("data", "resized_images")
+
+# Folder where we will save adjusted images (after changing brightness, contrast, etc.).
+ADJUSTED_IMAGE_DIR = os.path.join("data", "adjusted_images")
+
+# Feature separation for later transformations
+# These lists mark which measured features we plan to actively adjust
+# (for example via brightness/contrast/saturation/resize) and which ones
+# we will mostly monitor and, if needed, use for excluding images.
+
+ADJUSTABLE_FEATURES = [
+    "exposure",
+    "avg_intensity",
+    "contrast",
+    "avg_sat",
+    "height",
+    "width",
+]
+
+MEASURE_ONLY_FEATURES = [
+    "sharpness",
+    # Colour properties we usually do not change directly
+    "colorfulness",
+    "avg_hue",
+    "dom_hue",
+    "hsv_depth",
+    "central_h",
+    "central_s",
+    "central_v",
+    # Texture (GLCM-based)
+    "hue_tex",
+    "sat_tex",
+    # Derived size measure (follows from height and width)
+    "sum_hw",
+]
+
+
 def ensure_output_folder_exists() -> None:
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def ensure_resized_folder_exists() -> None:
+    """
+    Make sure the folder for resized images exists.
+    We keep resized copies separate so original images are not changed.
+    """
+
+    os.makedirs(RESIZED_IMAGE_DIR, exist_ok=True)
+
+
+def ensure_adjusted_folder_exists() -> None:
+    """
+    Make sure the folder for adjusted images exists.
+    We keep adjusted copies separate so original images are not changed.
+    """
+
+    os.makedirs(ADJUSTED_IMAGE_DIR, exist_ok=True)
 
 
 def list_image_files(input_dir: str) -> List[str]:
@@ -128,15 +187,13 @@ def compute_all_features_for_image(image_bgr: np.ndarray, image_path: str) -> Di
     # Convert to grayscale for technical features
     image_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
- 
     # Technical Categorie (Sharpness, Exposure, Contrast, Average Intensity)
     # Sharpness: Laplacian variance – higher = sharper (more edges)
     laplacian = cv2.Laplacian(image_gray, cv2.CV_64F)
     sharpness = float(laplacian.var())
 
-    # Exposure and Average Intensity: same thing (mean of grayscale)
-    exposure = float(np.mean(image_gray))
-    avg_intensity = exposure
+    # Average Intensity: mean of grayscale values
+    avg_intensity = float(np.mean(image_gray))
 
     # Contrast: standard deviation of grayscale intensity
     contrast = float(np.std(image_gray))
@@ -145,6 +202,9 @@ def compute_all_features_for_image(image_bgr: np.ndarray, image_path: str) -> Di
     # Colour Categorie (Colourfulness, Average saturation and hue , Dominant Hue, HSV Depth, Central HSV metrics )
     image_hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     h_channel, s_channel, v_channel = cv2.split(image_hsv)
+
+    # Exposure: mean of V channel (brightness in HSV space)
+    exposure = float(np.mean(v_channel))
 
     # Average saturation and hue
     avg_sat = float(np.mean(s_channel))
@@ -241,6 +301,66 @@ def process_all_images(input_dir: str) -> pd.DataFrame:
     return df
 
 
+def resize_and_save_all_images(
+    input_dir: str,
+    output_dir: str,
+    target_width: int = 800,
+    target_height: int = 800,
+) -> None:
+    """
+    Resize all images from input_dir, preserving aspect ratio, and save copies.
+
+    - Images are scaled so that they fit *within* target_width x target_height.
+    - Aspect ratio is preserved (no stretching or squashing).
+    - We do NOT overwrite the original files.
+    """
+
+    if not os.path.isdir(input_dir):
+        print(f"Cannot resize images: input folder does not exist: {input_dir}")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    image_paths = list_image_files(input_dir)
+    if not image_paths:
+        print(f"No images found in folder for resizing: {input_dir}")
+        return
+
+    print(
+        f"\nResizing images to fit within {target_width}x{target_height} "
+        f"(preserving aspect ratio) and saving copies to: {output_dir}"
+    )
+
+    for path in image_paths:
+        image = cv2.imread(path)
+        if image is None:
+            print(f"WARNING: Could not read image at path (resize step): {path}. Skipping.")
+            continue
+
+        # Current size of the image
+        h, w = image.shape[:2]
+
+        # If the image already fits within the target box, keep it as-is.
+        if h <= target_height and w <= target_width:
+            resized = image
+        else:
+            # Scale image to fit within target_width x target_height
+            scale = min(target_width / float(w), target_height / float(h))
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            resized = cv2.resize(
+                image,
+                (new_w, new_h),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        # Keep only the filename part when saving.
+        filename = os.path.basename(path)
+        save_path = os.path.join(output_dir, filename)
+        success = cv2.imwrite(save_path, resized)
+        if not success:
+            print(f"WARNING: Could not save resized image to: {save_path}")
+
 def _compute_mad(x: np.ndarray) -> float:
     # Median Absolute Deviation [MAD = 1.4826 × Med(|x - Med(x)|)].
     med = np.median(x)
@@ -275,12 +395,193 @@ def flag_mad_outliers(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def print_feature_summary(df: pd.DataFrame) -> None:
+    """Print mean and standard deviation for adjustable features."""
+
+    print("\nFeature summary for adjustable features (all images):")
+    for feat in ADJUSTABLE_FEATURES:
+        if feat in df.columns:
+            mean_val = df[feat].mean()
+            std_val = df[feat].std()
+            print(f"  {feat:>12}: mean = {mean_val:.2f}, std = {std_val:.2f}")
+
+
+def summarize_outliers_by_image(outlier_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarise how many outliers each image has, split by feature type.
+
+    This will help later when we decide which images to exclude
+    (e.g. many measure-only outliers) versus which ones we might
+    try to adjust (adjustable-feature outliers).
+    """
+
+    def _feature_type(feat: str) -> str:
+        if feat in ADJUSTABLE_FEATURES:
+            return "adjustable"
+        if feat in MEASURE_ONLY_FEATURES:
+            return "measure_only"
+        return "other"
+
+    # Work on a copy so we don't modify the original DataFrame by accident.
+    outlier_df = outlier_df.copy()
+    outlier_df["feature_type"] = outlier_df["feature"].apply(_feature_type)
+
+    # We only want rows where the value was actually flagged as an outlier.
+    out_only = outlier_df[outlier_df["is_outlier"] == True]
+
+    if out_only.empty:
+        print("\nNo outliers to summarise (no values flagged).")
+        return pd.DataFrame()
+
+    # Count how many outliers each image has, for each feature type.
+    summary = (
+        out_only
+        .groupby(["filename", "feature_type"])
+        .size()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+
+    # Make sure the expected columns exist even if there were no outliers
+    # of that type in this particular run.
+    for col in ["adjustable", "measure_only", "other"]:
+        if col not in summary.columns:
+            summary[col] = 0
+
+    summary["total_outliers"] = (
+        summary["adjustable"] + summary["measure_only"] + summary["other"]
+    )
+
+    print("\nOutlier summary per image:")
+    for _, row in summary.iterrows():
+        print(
+            f"  {row['filename']}: "
+            f"adjustable={row['adjustable']}, "
+            f"measure_only={row['measure_only']}, "
+            f"other={row['other']}, "
+            f"total={row['total_outliers']}"
+        )
+
+    return summary
+
+
+def build_adjustment_plan(
+    features_df: pd.DataFrame, outlier_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Create a simple plan showing which adjustable features should be changed.
+
+    - We only consider rows where:
+        * the feature is in ADJUSTABLE_FEATURES, and
+        * is_outlier is True (flagged by the MAD method).
+    - For each adjustable feature we also attach the global mean, which
+      can be used later as a target level for adjustments.
+    """
+
+    # Compute global means for adjustable features (for later use as targets).
+    means = {}
+    for feat in ADJUSTABLE_FEATURES:
+        if feat in features_df.columns:
+            means[feat] = features_df[feat].mean()
+
+    # Keep only adjustable features that are flagged as outliers.
+    mask = (outlier_df["is_outlier"] == True) & (
+        outlier_df["feature"].isin(ADJUSTABLE_FEATURES)
+    )
+    to_adjust = outlier_df[mask].copy()
+
+    if to_adjust.empty:
+        print("\nNo adjustable features were flagged as outliers.")
+        return pd.DataFrame()
+
+    # Attach target_mean for each feature (if available).
+    to_adjust["target_mean"] = to_adjust["feature"].map(means)
+
+    print("\nAdjustment plan (per image and adjustable feature):")
+    for _, row in to_adjust.iterrows():
+        fname = row["filename"]
+        feat = row["feature"]
+        value = row["value"]
+        target = row["target_mean"]
+        print(
+            f"  {fname} → {feat}: current={value:.2f}, "
+            f"target_mean={target:.2f}"
+        )
+
+    return to_adjust
+
+
+def adjust_exposure_from_plan(
+    plan_df: pd.DataFrame,
+    input_dir: str,
+    output_dir: str,
+) -> None:
+    """
+    Apply simple exposure (brightness) adjustments according to the plan.
+
+    For now we:
+    - Look only at rows where feature == "exposure".
+    - Adjust the V channel in HSV so that the mean exposure
+      moves toward the global target_mean for exposure.
+    - Save adjusted copies in output_dir, one per original image.
+    """
+
+    # Keep only exposure rows from the plan.
+    if plan_df is None or plan_df.empty:
+        print("\nNo adjustment plan available, skipping exposure adjustment.")
+        return
+
+    exposure_rows = plan_df[plan_df["feature"] == "exposure"]
+    if exposure_rows.empty:
+        print("\nNo exposure outliers in the adjustment plan, nothing to change.")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\nAdjusting exposure for {len(exposure_rows)} images.")
+
+    for _, row in exposure_rows.iterrows():
+        filename = row["filename"]
+        current_val = float(row["value"])
+        target_val = float(row["target_mean"])
+
+        img_path = os.path.join(input_dir, filename)
+        image = cv2.imread(img_path)
+        if image is None:
+            print(f"WARNING: Could not read image for exposure adjustment: {img_path}")
+            continue
+
+        # Convert to HSV to manipulate brightness (V channel).
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+
+        if current_val <= 0:
+            # Avoid division by zero; in this unlikely case we skip adjustment.
+            print(f"WARNING: Non-positive current exposure for {filename}, skipping.")
+            adjusted_v = v
+        else:
+            # Scale V so that its mean moves toward the target mean.
+            scale = target_val / current_val
+            v_float = v.astype(np.float32) * scale
+            adjusted_v = np.clip(v_float, 0, 255).astype(np.uint8)
+
+        hsv_adjusted = cv2.merge([h, s, adjusted_v])
+        adjusted_bgr = cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2BGR)
+
+        save_path = os.path.join(output_dir, filename)
+        success = cv2.imwrite(save_path, adjusted_bgr)
+        if not success:
+            print(f"WARNING: Could not save adjusted image to: {save_path}")
+
+
 def main() -> None:
     print("Image feature extraction (all 17 features)")
     print(f"Looking for images in: {INPUT_DIR}")
 
     ensure_output_folder_exists()
 
+    # Measure features and run MAD on the original images.
+    # This tells us which images are problematic in their native form.
     df = process_all_images(INPUT_DIR)
 
     if df.empty:
@@ -291,15 +592,32 @@ def main() -> None:
     df.to_csv(CSV_OUTPUT_PATH, index=False)
     print(f"\nSaved {len(df)} rows to: {CSV_OUTPUT_PATH}")
 
+    # Quick numeric summary for adjustable technical features
+    print_feature_summary(df)
+
     # Outlier flagging
     print("\n Outlier detection")
     outlier_df = flag_mad_outliers(df)
     outlier_df.to_csv(OUTLIER_REPORT_PATH, index=False)
     print(f"Outlier report saved to: {OUTLIER_REPORT_PATH}")
 
-    # Summary: total outliers
+    # Summary: total outliers (all features, all images)
     n_outliers = outlier_df["is_outlier"].sum()
     print(f"Total outlier values: {n_outliers}")
+
+    # Per-image outlier summary to help decide later which images to keep/exclude
+    summarize_outliers_by_image(outlier_df)
+
+    # Build a simple adjustment plan for adjustable features based on MAD outliers.
+    plan_df = build_adjustment_plan(df, outlier_df)
+
+    # Example: apply exposure adjustments only (brightness), using originals as input.
+    ensure_adjusted_folder_exists()
+    adjust_exposure_from_plan(
+        plan_df=plan_df,
+        input_dir=INPUT_DIR,
+        output_dir=ADJUSTED_IMAGE_DIR,
+    )
 
 
 if __name__ == "__main__":
