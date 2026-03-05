@@ -88,6 +88,10 @@ RESIZED_IMAGE_DIR = os.path.join("data", "resized_images")
 # Folder where we will save adjusted images (after changing brightness, contrast, etc.).
 ADJUSTED_IMAGE_DIR = os.path.join("data", "adjusted_images")
 
+# Names of the three experimental conditions, used when images live
+# in subfolders like data/input/isolated, data/input/in_use, etc.
+CONDITION_NAMES = ("isolated", "in_use", "environmental")
+
 # Feature separation for later transformations
 # These lists mark which measured features we plan to actively adjust
 # (for example via brightness/contrast/saturation/resize) and which ones
@@ -157,15 +161,22 @@ def reset_adjusted_folder() -> None:
 
 
 def list_image_files(input_dir: str) -> List[str]:
-    """Find .jpg, .jpeg, .png files in the top level of input_dir."""
+    """
+    Find .jpg, .jpeg, .png files under input_dir (recursively).
+
+    This lets us organise images in subfolders such as:
+      data/input/isolated, data/input/in_use, data/input/environmental
+    without changing the rest of the code.
+    """
     if not os.path.isdir(input_dir):
         return []
     allowed = {".jpg", ".jpeg", ".png"}
-    paths = []
-    for name in os.listdir(input_dir):
-        p = os.path.join(input_dir, name)
-        if os.path.isfile(p) and os.path.splitext(name.lower())[1] in allowed:
-            paths.append(p)
+    paths: List[str] = []
+    for root, _, files in os.walk(input_dir):
+        for name in files:
+            ext = os.path.splitext(name.lower())[1]
+            if ext in allowed:
+                paths.append(os.path.join(root, name))
     return paths
 
 
@@ -258,10 +269,20 @@ def compute_all_features_for_image(image_bgr: np.ndarray, image_path: str) -> Di
     hue_tex = _compute_glcm_texture(h_channel, levels=8)
     sat_tex = _compute_glcm_texture(s_channel, levels=8)
 
+    # Condition label inferred from folder name, if possible.
+    # We look for .../isolated/ or .../in_use/ or .../environmental/ in the path.
+    condition = "unknown"
+    for cand in CONDITION_NAMES:
+        marker = os.sep + cand + os.sep
+        if marker in image_path:
+            condition = cand
+            break
+
 
     # Feature dictionary
     features: Dict[str, Any] = {
         "filename": os.path.basename(image_path),
+        "condition": condition,
         # Technical
         "sharpness": sharpness,
         "exposure": exposure,
@@ -386,7 +407,7 @@ def _compute_mad(x: np.ndarray) -> float:
 
 def flag_mad_outliers(df: pd.DataFrame) -> pd.DataFrame:
     # Flag images whose feature values fall outside median ± 2.5 × MAD.
-    numeric_cols = [c for c in df.columns if c != "filename"]
+    numeric_cols = [c for c in df.columns if c not in ("filename", "condition")]
     rows = []
     for feat in numeric_cols:
         vals = df[feat].values
@@ -420,6 +441,30 @@ def print_feature_summary(df: pd.DataFrame) -> None:
             mean_val = df[feat].mean()
             std_val = df[feat].std()
             print(f"  {feat:>12}: mean = {mean_val:.2f}, std = {std_val:.2f}")
+
+
+def print_condition_summary(df: pd.DataFrame, title: str) -> None:
+    """
+    Print mean and standard deviation for adjustable features per condition.
+
+    This will be most useful once images are organised into folders like:
+      data/input/isolated, data/input/in_use, data/input/environmental
+    so that the 'condition' column has meaningful values.
+    """
+
+    if "condition" not in df.columns:
+        print("\nNo 'condition' column found in DataFrame.")
+        return
+
+    print(f"\n{title}")
+    grouped = df.groupby("condition")
+    for condition, group in grouped:
+        print(f"\nCondition: {condition} (n={len(group)})")
+        for feat in ADJUSTABLE_FEATURES:
+            if feat in group.columns:
+                mean_val = group[feat].mean()
+                std_val = group[feat].std()
+                print(f"  {feat:>12}: mean = {mean_val:.2f}, std = {std_val:.2f}")
 
 
 def summarize_outliers_by_image(outlier_df: pd.DataFrame) -> pd.DataFrame:
@@ -759,6 +804,12 @@ def measure_adjusted_images() -> None:
     print("\nFeature summary AFTER adjustment (adjusted images):")
     print_feature_summary(df_after)
 
+    # Per-condition summary after adjustment (if conditions are defined)
+    print_condition_summary(
+        df_after,
+        title="Per-condition summary AFTER adjustment (adjusted images)",
+    )
+
 
 def main() -> None:
     print("Image feature extraction (all 17 features)")
@@ -780,6 +831,13 @@ def main() -> None:
 
     # Quick numeric summary for adjustable technical features
     print_feature_summary(df)
+
+    # Per-condition summary BEFORE any adjustments (will be most informative
+    # once images live in condition-specific subfolders)
+    print_condition_summary(
+        df,
+        title="Per-condition summary BEFORE adjustment (original images)",
+    )
 
     # Outlier flagging
     print("\n Outlier detection")
