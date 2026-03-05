@@ -123,6 +123,29 @@ MEASURE_ONLY_FEATURES = [
     "sum_hw",
 ]
 
+# How many measure-only outliers an image is allowed before we exclude it.
+# Images with MORE than this number won't be adjusted (they should be
+# replaced with better images or dropped from the experiment).
+MAX_MEASURE_ONLY_OUTLIERS = 0
+
+# How far toward the target we move in a single adjustment (0.0 = no change,
+# 1.0 = move all the way).  0.5 means we close half the gap, which avoids
+# drastic changes that make images look unnatural.
+DAMPING = 0.5
+
+
+def _find_original_image(filename: str) -> str:
+    """
+    Find the full path of an image by filename, searching recursively
+    under INPUT_DIR.  Images live in condition subfolders like
+    data/input/isolated/, so we can't just do INPUT_DIR + filename.
+    Returns the first match, or an empty string if not found.
+    """
+    for root, _, files in os.walk(INPUT_DIR):
+        if filename in files:
+            return os.path.join(root, filename)
+    return ""
+
 
 def ensure_output_folder_exists() -> None:
 
@@ -406,29 +429,76 @@ def _compute_mad(x: np.ndarray) -> float:
 
 
 def flag_mad_outliers(df: pd.DataFrame) -> pd.DataFrame:
-    # Flag images whose feature values fall outside median ± 2.5 × MAD.
+    """
+    Flag images whose feature values fall outside median ± 2.5 × MAD.
+
+    If images have a 'condition' column with real condition labels,
+    MAD is computed WITHIN each condition separately (so each image
+    is compared only to others in the same condition).
+    Otherwise, MAD is computed globally across all images.
+    """
+
     numeric_cols = [c for c in df.columns if c not in ("filename", "condition")]
+
+    # Check if we have real condition labels (not just "unknown").
+    has_conditions = (
+        "condition" in df.columns
+        and df["condition"].nunique() > 1
+        and not (df["condition"] == "unknown").all()
+    )
+
     rows = []
-    for feat in numeric_cols:
-        vals = df[feat].values
-        median = np.median(vals)
-        mad = _compute_mad(vals)
-        k = 2.5
-        lower = median - k * mad
-        upper = median + k * mad
-        for i, fn in enumerate(df["filename"]):
-            v = vals[i]
-            out = v < lower or v > upper
-            rows.append({
-                "filename": fn,
-                "feature": feat,
-                "value": v,
-                "median": median,
-                "mad": mad,
-                "lower_bound": lower,
-                "upper_bound": upper,
-                "is_outlier": out,
-            })
+
+    if has_conditions:
+        # Within-condition MAD: each condition is treated independently.
+        print("  (Running MAD within each condition separately.)")
+        for condition, group in df.groupby("condition"):
+            for feat in numeric_cols:
+                vals = group[feat].values
+                median = np.median(vals)
+                mad = _compute_mad(vals)
+                k = 2.5
+                lower = median - k * mad
+                upper = median + k * mad
+                for i, fn in enumerate(group["filename"]):
+                    v = vals[i]
+                    out = v < lower or v > upper
+                    rows.append({
+                        "filename": fn,
+                        "condition": condition,
+                        "feature": feat,
+                        "value": v,
+                        "median": median,
+                        "mad": mad,
+                        "lower_bound": lower,
+                        "upper_bound": upper,
+                        "is_outlier": out,
+                    })
+    else:
+        # Fallback: global MAD across all images (no condition info).
+        print("  (Running MAD globally – no condition subfolders detected.)")
+        for feat in numeric_cols:
+            vals = df[feat].values
+            median = np.median(vals)
+            mad = _compute_mad(vals)
+            k = 2.5
+            lower = median - k * mad
+            upper = median + k * mad
+            for i, fn in enumerate(df["filename"]):
+                v = vals[i]
+                out = v < lower or v > upper
+                rows.append({
+                    "filename": fn,
+                    "condition": "unknown",
+                    "feature": feat,
+                    "value": v,
+                    "median": median,
+                    "mad": mad,
+                    "lower_bound": lower,
+                    "upper_bound": upper,
+                    "is_outlier": out,
+                })
+
     return pd.DataFrame(rows)
 
 
@@ -467,13 +537,17 @@ def print_condition_summary(df: pd.DataFrame, title: str) -> None:
                 print(f"  {feat:>12}: mean = {mean_val:.2f}, std = {std_val:.2f}")
 
 
-def summarize_outliers_by_image(outlier_df: pd.DataFrame) -> pd.DataFrame:
+def summarize_outliers_by_image(
+    outlier_df: pd.DataFrame,
+    features_df: pd.DataFrame,
+) -> pd.DataFrame:
     """
     Summarise how many outliers each image has, split by feature type.
+    Shows ALL images (including those with zero outliers) so you can
+    see the full picture.
 
-    This will help later when we decide which images to exclude
-    (e.g. many measure-only outliers) versus which ones we might
-    try to adjust (adjustable-feature outliers).
+    Images with more than MAX_MEASURE_ONLY_OUTLIERS measure-only outliers
+    are marked as "EXCLUDE".
     """
 
     def _feature_type(feat: str) -> str:
@@ -483,93 +557,144 @@ def summarize_outliers_by_image(outlier_df: pd.DataFrame) -> pd.DataFrame:
             return "measure_only"
         return "other"
 
-    # Work on a copy so we don't modify the original DataFrame by accident.
     outlier_df = outlier_df.copy()
     outlier_df["feature_type"] = outlier_df["feature"].apply(_feature_type)
 
-    # We only want rows where the value was actually flagged as an outlier.
     out_only = outlier_df[outlier_df["is_outlier"] == True]
 
-    if out_only.empty:
-        print("\nNo outliers to summarise (no values flagged).")
-        return pd.DataFrame()
+    # Build a base list of ALL images (with condition) from features_df,
+    # so images with zero outliers still appear.
+    has_cond = "condition" in features_df.columns
+    if has_cond:
+        all_images = features_df[["filename", "condition"]].drop_duplicates()
+    else:
+        all_images = features_df[["filename"]].drop_duplicates()
+        all_images["condition"] = "unknown"
 
-    # Count how many outliers each image has, for each feature type.
-    summary = (
-        out_only
-        .groupby(["filename", "feature_type"])
-        .size()
-        .unstack(fill_value=0)
-        .reset_index()
-    )
+    # Count outliers per image per feature type.
+    if not out_only.empty:
+        group_cols = ["condition", "filename"] if "condition" in out_only.columns else ["filename"]
+        counts = (
+            out_only
+            .groupby(group_cols + ["feature_type"])
+            .size()
+            .unstack(fill_value=0)
+            .reset_index()
+        )
+        if "condition" not in counts.columns:
+            counts["condition"] = "unknown"
+    else:
+        counts = pd.DataFrame(columns=["condition", "filename"])
 
-    # Make sure the expected columns exist even if there were no outliers
-    # of that type in this particular run.
     for col in ["adjustable", "measure_only", "other"]:
-        if col not in summary.columns:
-            summary[col] = 0
+        if col not in counts.columns:
+            counts[col] = 0
+
+    # Merge with all_images so zero-outlier images appear too.
+    summary = all_images.merge(
+        counts, on=["condition", "filename"], how="left"
+    ).fillna(0)
+
+    for col in ["adjustable", "measure_only", "other"]:
+        summary[col] = summary[col].astype(int)
 
     summary["total_outliers"] = (
         summary["adjustable"] + summary["measure_only"] + summary["other"]
     )
 
-    print("\nOutlier summary per image:")
-    for _, row in summary.iterrows():
-        print(
-            f"  {row['filename']}: "
-            f"adjustable={row['adjustable']}, "
-            f"measure_only={row['measure_only']}, "
-            f"other={row['other']}, "
-            f"total={row['total_outliers']}"
-        )
+    # Mark images that should be excluded.
+    summary["exclude"] = summary["measure_only"] > MAX_MEASURE_ONLY_OUTLIERS
+
+    # Print grouped by condition.
+    print(f"\nOutlier summary per image (within-condition, "
+          f"exclude if measure_only > {MAX_MEASURE_ONLY_OUTLIERS}):")
+    for condition in sorted(summary["condition"].unique()):
+        cond_group = summary[summary["condition"] == condition]
+        print(f"\n  Condition: {condition}")
+        for _, row in cond_group.sort_values("filename").iterrows():
+            tag = " << EXCLUDE" if row["exclude"] else ""
+            print(
+                f"    {row['filename']}: "
+                f"adjustable={row['adjustable']}, "
+                f"measure_only={row['measure_only']}, "
+                f"total={row['total_outliers']}{tag}"
+            )
+
+    n_excluded = summary["exclude"].sum()
+    n_kept = len(summary) - n_excluded
+    print(f"\n  Images to keep: {n_kept}  |  Images to exclude: {n_excluded}")
 
     return summary
 
 
-def build_adjustment_plan(
-    features_df: pd.DataFrame, outlier_df: pd.DataFrame
+def build_triplet_adjustment_plan(
+    features_df: pd.DataFrame,
+    triplet_files: List[str],
 ) -> pd.DataFrame:
     """
-    Create a simple plan showing which adjustable features should be changed.
+    Build an adjustment plan for ONLY the 3 chosen triplet images.
 
-    - We only consider rows where:
-        * the feature is in ADJUSTABLE_FEATURES, and
-        * is_outlier is True (flagged by the MAD method).
-    - For each adjustable feature we also attach the global mean, which
-      can be used later as a target level for adjustments.
+    The target for each adjustable feature is the mean of those 3 images
+    (the triplet mean), damped by DAMPING.  This way the 3 images are
+    pulled toward each other, not toward some unrelated global average.
     """
 
-    # Compute global means for adjustable features (for later use as targets).
-    means = {}
-    for feat in ADJUSTABLE_FEATURES:
-        if feat in features_df.columns:
-            means[feat] = features_df[feat].mean()
+    # Keep only the triplet rows from the features table.
+    triplet_df = features_df[features_df["filename"].isin(triplet_files)]
 
-    # Keep only adjustable features that are flagged as outliers.
-    mask = (outlier_df["is_outlier"] == True) & (
-        outlier_df["feature"].isin(ADJUSTABLE_FEATURES)
-    )
-    to_adjust = outlier_df[mask].copy()
-
-    if to_adjust.empty:
-        print("\nNo adjustable features were flagged as outliers.")
+    if triplet_df.empty:
+        print("\nNo triplet images found in features table.")
         return pd.DataFrame()
 
-    # Attach target_mean for each feature (if available).
-    to_adjust["target_mean"] = to_adjust["feature"].map(means)
+    # Triplet mean = the target the 3 images should converge toward.
+    triplet_means: Dict[str, float] = {}
+    for feat in ADJUSTABLE_FEATURES:
+        if feat in triplet_df.columns:
+            triplet_means[feat] = triplet_df[feat].mean()
 
-    print("\nAdjustment plan (per image and adjustable feature):")
-    for _, row in to_adjust.iterrows():
-        fname = row["filename"]
-        feat = row["feature"]
-        value = row["value"]
-        target = row["target_mean"]
+    # For each image × adjustable feature, check if it differs enough
+    # from the triplet mean to warrant adjustment.  We use a simple
+    # threshold: if the value is more than 5% away from the triplet
+    # mean, we plan an adjustment.
+    rows = []
+    for _, img_row in triplet_df.iterrows():
+        fn = img_row["filename"]
+        cond = img_row.get("condition", "unknown")
+        for feat in ADJUSTABLE_FEATURES:
+            if feat not in img_row.index or feat not in triplet_means:
+                continue
+            current = float(img_row[feat])
+            target = triplet_means[feat]
+            if target == 0:
+                continue
+            pct_diff = abs(current - target) / abs(target)
+            if pct_diff > 0.05:
+                damped = current + DAMPING * (target - current)
+                rows.append({
+                    "filename": fn,
+                    "condition": cond,
+                    "feature": feat,
+                    "value": current,
+                    "target_mean": target,
+                    "damped_target": damped,
+                })
+
+    if not rows:
+        print("\nTriplet images are already very similar — no adjustment needed!")
+        return pd.DataFrame()
+
+    plan = pd.DataFrame(rows)
+
+    print(f"\nAdjustment plan for chosen triplet (damping={DAMPING}):")
+    for _, row in plan.iterrows():
         print(
-            f"  {fname} → {feat}: current={value:.2f}, "
-            f"target_mean={target:.2f}"
+            f"  [{row['condition']}] {row['filename']} -> {row['feature']}: "
+            f"current={row['value']:.2f}, "
+            f"triplet_mean={row['target_mean']:.2f}, "
+            f"damped_target={row['damped_target']:.2f}"
         )
 
-    return to_adjust
+    return plan
 
 
 def adjust_exposure_from_plan(
@@ -604,24 +729,24 @@ def adjust_exposure_from_plan(
     for _, row in exposure_rows.iterrows():
         filename = row["filename"]
         current_val = float(row["value"])
-        target_val = float(row["target_mean"])
+        target_val = float(row["damped_target"])
 
-        img_path = os.path.join(input_dir, filename)
+        img_path = _find_original_image(filename)
+        if not img_path:
+            print(f"WARNING: Could not find original image: {filename}")
+            continue
         image = cv2.imread(img_path)
         if image is None:
             print(f"WARNING: Could not read image for exposure adjustment: {img_path}")
             continue
 
-        # Convert to HSV to manipulate brightness (V channel).
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         h, s, v = cv2.split(hsv)
 
         if current_val <= 0:
-            # Avoid division by zero; in this unlikely case we skip adjustment.
             print(f"WARNING: Non-positive current exposure for {filename}, skipping.")
             adjusted_v = v
         else:
-            # Scale V so that its mean moves toward the target mean.
             scale = target_val / current_val
             v_float = v.astype(np.float32) * scale
             adjusted_v = np.clip(v_float, 0, 255).astype(np.uint8)
@@ -649,9 +774,11 @@ def _load_image_preferring_adjusted(filename: str) -> np.ndarray:
         if image is not None:
             return image
 
-    # Fallback to the original input folder.
-    original_path = os.path.join(INPUT_DIR, filename)
-    return cv2.imread(original_path)
+    # Fallback: search recursively under INPUT_DIR (images are in subfolders).
+    original_path = _find_original_image(filename)
+    if original_path:
+        return cv2.imread(original_path)
+    return None
 
 
 def adjust_contrast_from_plan(
@@ -685,7 +812,7 @@ def adjust_contrast_from_plan(
     for _, row in contrast_rows.iterrows():
         filename = row["filename"]
         current_contrast = float(row["value"])
-        target_contrast = float(row["target_mean"])
+        target_contrast = float(row["damped_target"])
 
         image = _load_image_preferring_adjusted(filename)
         if image is None:
@@ -750,7 +877,7 @@ def adjust_saturation_from_plan(
     for _, row in sat_rows.iterrows():
         filename = row["filename"]
         current_sat = float(row["value"])
-        target_sat = float(row["target_mean"])
+        target_sat = float(row["damped_target"])
 
         image = _load_image_preferring_adjusted(filename)
         if image is None:
@@ -779,13 +906,12 @@ def adjust_saturation_from_plan(
             print(f"WARNING: Could not save saturation-adjusted image to: {save_path}")
 
 
-def measure_adjusted_images() -> None:
+def measure_adjusted_images(original_df: pd.DataFrame) -> None:
     """
     Re-measure all features on the adjusted images and save to a new CSV.
 
-    This gives us an \"after\" table (image_features_after.csv) that can be
-    compared to the original measurements to see how much the adjustments
-    reduced differences between images / conditions.
+    The adjusted images live flat in ADJUSTED_IMAGE_DIR (no subfolders),
+    so we carry over the condition label from the original measurements.
     """
 
     if not os.path.isdir(ADJUSTED_IMAGE_DIR):
@@ -797,91 +923,284 @@ def measure_adjusted_images() -> None:
         print("\nNo adjusted images were processed, skipping after-measurement.")
         return
 
+    # Carry over condition labels from the original features table,
+    # because the adjusted images are saved flat (no condition subfolders).
+    if "condition" in original_df.columns:
+        cond_map = original_df.set_index("filename")["condition"].to_dict()
+        df_after["condition"] = df_after["filename"].map(cond_map).fillna("unknown")
+
     df_after.to_csv(CSV_AFTER_OUTPUT_PATH, index=False)
     print(f"\nSaved adjusted-image features to: {CSV_AFTER_OUTPUT_PATH}")
 
-    # Quick summary for adjustable features after adjustment
     print("\nFeature summary AFTER adjustment (adjusted images):")
     print_feature_summary(df_after)
 
-    # Per-condition summary after adjustment (if conditions are defined)
     print_condition_summary(
         df_after,
         title="Per-condition summary AFTER adjustment (adjusted images)",
     )
 
 
+def find_best_triplets(
+    features_df: pd.DataFrame,
+    exclusion_summary: pd.DataFrame,
+    outlier_df: pd.DataFrame,
+    top_n: int = 5,
+) -> pd.DataFrame:
+    """
+    Find the best-matching triplet of images (one per condition) whose
+    technical features are already the most similar.
+
+    For each recommended triplet it also shows:
+      - The raw feature values side by side.
+      - Which features are flagged as outliers (adjustable or measure-only).
+      - A verdict: "ready" / "needs small adjustment" / "has measure-only issues".
+    """
+
+    if "condition" not in features_df.columns:
+        print("\nCannot find best triplet: no condition labels.")
+        return pd.DataFrame()
+
+    # Remove excluded images.
+    keep_files = set(features_df["filename"])
+    if exclusion_summary is not None and not exclusion_summary.empty:
+        excluded = set(
+            exclusion_summary.loc[
+                exclusion_summary["exclude"] == True, "filename"
+            ]
+        )
+        keep_files -= excluded
+
+    df = features_df[features_df["filename"].isin(keep_files)].copy()
+
+    conditions = sorted(df["condition"].unique())
+    if len(conditions) < 3:
+        print(f"\nNeed 3 conditions to form a triplet, found {len(conditions)}.")
+        return pd.DataFrame()
+
+    iso = df[df["condition"] == "isolated"]
+    use = df[df["condition"] == "in_use"]
+    env = df[df["condition"] == "environmental"]
+
+    if iso.empty or use.empty or env.empty:
+        print("\nAt least one condition has no (non-excluded) images.")
+        return pd.DataFrame()
+
+    numeric_cols = [
+        c for c in df.columns if c not in ("filename", "condition")
+    ]
+
+    # Z-score so all features contribute equally.
+    means = df[numeric_cols].mean()
+    stds = df[numeric_cols].std().replace(0, 1)
+    df_z = df.copy()
+    df_z[numeric_cols] = (df[numeric_cols] - means) / stds
+
+    iso_z = df_z[df_z["condition"] == "isolated"]
+    use_z = df_z[df_z["condition"] == "in_use"]
+    env_z = df_z[df_z["condition"] == "environmental"]
+
+    results = []
+    for _, r_iso in iso_z.iterrows():
+        for _, r_use in use_z.iterrows():
+            for _, r_env in env_z.iterrows():
+                vals = np.array([
+                    [r_iso[f] for f in numeric_cols],
+                    [r_use[f] for f in numeric_cols],
+                    [r_env[f] for f in numeric_cols],
+                ])
+                score = float(np.sum(np.ptp(vals, axis=0)))
+                results.append({
+                    "isolated": r_iso["filename"],
+                    "in_use": r_use["filename"],
+                    "environmental": r_env["filename"],
+                    "score": score,
+                })
+
+    if not results:
+        print("\nNo valid triplets found.")
+        return pd.DataFrame()
+
+    ranking = pd.DataFrame(results).sort_values("score").reset_index(drop=True)
+
+    # Pre-build a quick lookup: filename -> list of outlier feature names,
+    # split into adjustable vs measure-only.
+    adj_outliers_by_file: Dict[str, list] = {}
+    mo_outliers_by_file: Dict[str, list] = {}
+    if outlier_df is not None and not outlier_df.empty:
+        flagged = outlier_df[outlier_df["is_outlier"] == True]
+        for _, orow in flagged.iterrows():
+            fn = orow["filename"]
+            feat = orow["feature"]
+            if feat in ADJUSTABLE_FEATURES:
+                adj_outliers_by_file.setdefault(fn, []).append(feat)
+            elif feat in MEASURE_ONLY_FEATURES:
+                mo_outliers_by_file.setdefault(fn, []).append(feat)
+
+    print(f"\n{'=' * 60}")
+    print(f"Top {min(top_n, len(ranking))} best-matching triplets")
+    print(f"(lower score = more similar across all {len(numeric_cols)} features)")
+    print(f"{'=' * 60}")
+
+    for i, row in ranking.head(top_n).iterrows():
+        print(f"\n  #{i + 1}  score = {row['score']:.2f}")
+
+        triplet_files = [row["isolated"], row["in_use"], row["environmental"]]
+        triplet_df = features_df[features_df["filename"].isin(triplet_files)]
+
+        # Build a dict: condition -> feature values (for aligned printing).
+        cond_vals: Dict[str, Dict[str, float]] = {}
+        for _, img_row in triplet_df.iterrows():
+            cond_vals[img_row["condition"]] = {
+                f: img_row[f] for f in numeric_cols
+            }
+
+        # Print image names with their outlier status.
+        for cond_key, file_key in [
+            ("isolated", "isolated"),
+            ("in_use", "in_use"),
+            ("environmental", "environmental"),
+        ]:
+            fn = row[file_key]
+            adj_out = adj_outliers_by_file.get(fn, [])
+            mo_out = mo_outliers_by_file.get(fn, [])
+
+            if not adj_out and not mo_out:
+                status = "no outliers"
+            elif adj_out and not mo_out:
+                status = f"adjustable outliers: {', '.join(adj_out)}"
+            elif mo_out and not adj_out:
+                status = f"measure-only outliers: {', '.join(mo_out)}"
+            else:
+                status = (
+                    f"adjustable: {', '.join(adj_out)}; "
+                    f"measure-only: {', '.join(mo_out)}"
+                )
+            print(f"    {cond_key + ':':16s} {fn}")
+            print(f"      -> {status}")
+
+        # Feature comparison table (adjustable features only for clarity).
+        print(f"    {'feature':>14}  {'isolated':>10}  {'in_use':>10}  {'environ.':>10}")
+        for feat in ADJUSTABLE_FEATURES:
+            v_iso = cond_vals.get("isolated", {}).get(feat, 0)
+            v_use = cond_vals.get("in_use", {}).get(feat, 0)
+            v_env = cond_vals.get("environmental", {}).get(feat, 0)
+            print(f"    {feat:>14}  {v_iso:>10.1f}  {v_use:>10.1f}  {v_env:>10.1f}")
+
+        # Quick verdict for the whole triplet.
+        all_adj = sum(len(adj_outliers_by_file.get(f, [])) for f in triplet_files)
+        all_mo = sum(len(mo_outliers_by_file.get(f, [])) for f in triplet_files)
+        if all_adj == 0 and all_mo == 0:
+            verdict = "PERFECT — no outliers, ready to use as-is"
+        elif all_mo == 0:
+            verdict = f"GOOD — {all_adj} adjustable outlier(s), can be fixed"
+        else:
+            verdict = (f"OK — {all_adj} adjustable + {all_mo} measure-only "
+                       f"outlier(s), check if acceptable")
+        print(f"    >> {verdict}")
+
+    return ranking
+
+
 def main() -> None:
-    print("Image feature extraction (all 17 features)")
+    print("=" * 60)
+    print("Image standardisation pipeline")
+    print("=" * 60)
     print(f"Looking for images in: {INPUT_DIR}")
 
     ensure_output_folder_exists()
 
-    # Measure features and run MAD on the original images.
-    # This tells us which images are problematic in their native form.
+    # ------------------------------------------------------------------
+    # STEP 1  Measure all 17 features on the original images.
+    # ------------------------------------------------------------------
+    print("\n--- Step 1: Measure features on original images ---")
     df = process_all_images(INPUT_DIR)
 
     if df.empty:
         print("No data to save (no images were found or processed).")
         return
 
-    # Save features to CSV
     df.to_csv(CSV_OUTPUT_PATH, index=False)
     print(f"\nSaved {len(df)} rows to: {CSV_OUTPUT_PATH}")
 
-    # Quick numeric summary for adjustable technical features
     print_feature_summary(df)
 
-    # Per-condition summary BEFORE any adjustments (will be most informative
-    # once images live in condition-specific subfolders)
     print_condition_summary(
         df,
         title="Per-condition summary BEFORE adjustment (original images)",
     )
 
-    # Outlier flagging
-    print("\n Outlier detection")
+    # ------------------------------------------------------------------
+    # STEP 2  Within-condition MAD outlier detection.
+    #         Each image is compared to others in its own condition.
+    #         This helps decide which images to EXCLUDE (measure-only
+    #         outliers) and which to ADJUST (adjustable-feature outliers).
+    # ------------------------------------------------------------------
+    print("\n--- Step 2: Within-condition outlier detection (MAD) ---")
     outlier_df = flag_mad_outliers(df)
     outlier_df.to_csv(OUTLIER_REPORT_PATH, index=False)
     print(f"Outlier report saved to: {OUTLIER_REPORT_PATH}")
 
-    # Summary: total outliers (all features, all images)
     n_outliers = outlier_df["is_outlier"].sum()
-    print(f"Total outlier values: {n_outliers}")
+    print(f"Total outlier flags: {n_outliers}")
 
-    # Per-image outlier summary to help decide later which images to keep/exclude
-    summarize_outliers_by_image(outlier_df)
+    exclusion_summary = summarize_outliers_by_image(outlier_df, df)
 
-    # Build a simple adjustment plan for adjustable features based on MAD outliers.
-    plan_df = build_adjustment_plan(df, outlier_df)
+    # ------------------------------------------------------------------
+    # STEP 3  Find the best-matching triplet (1 per condition) that
+    #         already has the most similar technical values.
+    # ------------------------------------------------------------------
+    print("\n--- Step 3: Find best triplet ---")
+    ranking = find_best_triplets(df, exclusion_summary, outlier_df, top_n=5)
 
-    # Reset adjusted images folder so each run starts from the original images.
+    if ranking is None or ranking.empty:
+        print("\nCould not find any valid triplets. Pipeline stops here.")
+        print("=" * 60)
+        return
+
+    # Pick the #1 best triplet automatically.
+    best = ranking.iloc[0]
+    triplet_files = [best["isolated"], best["in_use"], best["environmental"]]
+    print(f"\nChosen triplet (best match):")
+    print(f"  isolated:      {best['isolated']}")
+    print(f"  in_use:        {best['in_use']}")
+    print(f"  environmental: {best['environmental']}")
+
+    # ------------------------------------------------------------------
+    # STEP 4  Adjust ONLY the chosen triplet toward their shared mean.
+    #         This pulls the 3 images closer to each other, not toward
+    #         some unrelated global average.
+    # ------------------------------------------------------------------
+    print("\n--- Step 4: Adjust triplet toward shared mean ---")
+    plan_df = build_triplet_adjustment_plan(df, triplet_files)
+
     reset_adjusted_folder()
 
-    # Apply exposure adjustments first (brightness).
     adjust_exposure_from_plan(
         plan_df=plan_df,
         input_dir=INPUT_DIR,
         output_dir=ADJUSTED_IMAGE_DIR,
     )
 
-    # Then apply contrast adjustments, stacking on top of exposure changes
-    # (if any). Both adjustments are saved into the same adjusted_images folder.
     adjust_contrast_from_plan(
         plan_df=plan_df,
         output_dir=ADJUSTED_IMAGE_DIR,
     )
 
-    # Finally apply saturation adjustments (avg_sat), also stacking on top of
-    # any previous changes to create one final adjusted image per filename.
     adjust_saturation_from_plan(
         plan_df=plan_df,
         output_dir=ADJUSTED_IMAGE_DIR,
     )
 
-    # After all adjustments, re-measure features on the adjusted images
-    # so we have an \"after\" table for numeric comparison.
-    measure_adjusted_images()
+    # ------------------------------------------------------------------
+    # STEP 5  Re-measure the adjusted triplet images ("after").
+    # ------------------------------------------------------------------
+    print("\n--- Step 5: Re-measure adjusted triplet ---")
+    measure_adjusted_images(df)
+
+    print("\n" + "=" * 60)
+    print("Pipeline complete.")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
