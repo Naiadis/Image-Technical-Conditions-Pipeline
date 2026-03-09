@@ -1,62 +1,14 @@
 """
-Libraries used during implementation.
+Image standardisation pipeline.
 
-  OpenCV:
-      https://docs.opencv.org/4.x/d6/d00/tutorial_py_root.html
-    - Colourfulness (Hasler & Süsstrunk, 2003; PyImageSearch tutorial):
-      https://pyimagesearch.com/2017/06/05/computing-image-colorfulness-with-opencv-and-python/
-    - imread (load image from file):
-      https://docs.opencv.org/4.x/d4/da8/group__imgcodecs.html#ga288b8b3da0892bd651fce07b3bbd3a56
-    - cvtColor (BGR↔grayscale, BGR↔HSV):
-      https://docs.opencv.org/4.x/d8/d01/group__imgproc__color__conversions.html
-    - split (separate channels):
-      https://docs.opencv.org/4.x/d2/de8/group__core__array.html#ga0547c7fed86152d7e9d0096029c8518a
+Measures 17 image features, detects outliers within each condition,
+finds the best-matching triplet, and adjusts it toward a shared mean.
 
-  NumPy:
-    - mean, std, sqrt, abs, argmax, clip, histogram:
-      https://numpy.org/doc/stable/reference/routines.math.html
-      https://numpy.org/doc/stable/reference/generated/numpy.mean.html
-      https://numpy.org/doc/stable/reference/generated/numpy.std.html
-
-  pandas:
-    - DataFrame:
-      https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html
-    - to_csv:
-      https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_csv.html
-
-  scikit-image (texture):
-      https://www.tutorialspoint.com/scikit-image/scikit-image-glcm-texture-features.htm
-    - graycomatrix:
-      https://scikit-image.org/docs/stable/api/skimage.feature.html#skimage.feature.graycomatrix
-    - graycoprops:
-      https://scikit-image.org/docs/stable/api/skimage.feature.html#skimage.feature.graycoprops
-
-  Outlier detection (MAD method):
-    Shimizu Y (2022) Multiple Desirable Methods in Outlier Detection of Univariate
-    Data With R Source Codes. Front. Psychol. 12:819854.
-    doi: 10.3389/fpsyg.2021.819854
-    https://pmc.ncbi.nlm.nih.gov/articles/PMC8801745/
-
-
-What this script does so far:
-1. Looks in a folder for images (jpg, jpeg, png).
-2. For each image, it measures all 17 features from our plan (Maros et al., 2019):
-   - Technical: Sharpness, Exposure, Contrast, Average Intensity
-   - Colour: Colourfulness, Avg Saturation, Avg Hue, Dominant Hue, HSV Depth,
-             Central H, Central S, Central V
-   - Texture: Hue Texture, Saturation Texture
-   - Composition: Height, Width, Sum of Height and Width
-3. Saves results to image_features_all.csv (in case we want to open it in Excel / SPSS).
-4. Flags outliers using MAD method (Shimizu, 2022): values outside median ± 2.5 × MAD.
-5. Saves outlier report to outlier_report.csv.
-
-Later steps ='): image transformation, z-scoring maybe.
-To do: - Write the exact version of the libraries used in the script (freezing dependencies).
-    - Feature quality checks (e.g. saturation texture is always 0, or i get a weird value for colorfulness).
-    - check for things like "double files", coroupt files, etc.
+See README.md for full documentation, references, and folder structure.
 """
 
 import os
+import hashlib
 import shutil
 from typing import List, Dict, Any
 
@@ -102,12 +54,12 @@ ADJUSTABLE_FEATURES = [
     "avg_intensity",
     "contrast",
     "avg_sat",
+    "sharpness",
     "height",
     "width",
 ]
 
 MEASURE_ONLY_FEATURES = [
-    "sharpness",
     # Colour properties we usually do not change directly
     "colorfulness",
     "avg_hue",
@@ -131,7 +83,7 @@ MAX_MEASURE_ONLY_OUTLIERS = 0
 # How far toward the target we move in a single adjustment (0.0 = no change,
 # 1.0 = move all the way).  0.5 means we close half the gap, which avoids
 # drastic changes that make images look unnatural.
-DAMPING = 0.5
+DAMPING = 0.8
 
 
 def _find_original_image(filename: str) -> str:
@@ -145,6 +97,92 @@ def _find_original_image(filename: str) -> str:
         if filename in files:
             return os.path.join(root, filename)
     return ""
+
+
+def run_quality_checks(input_dir: str) -> None:
+    """
+    Run basic quality checks on all images before processing.
+    Catches problems early so you don't waste time on bad data.
+
+    Checks:
+      1. Corrupt files   — images that can't be opened by OpenCV.
+      2. Duplicate files  — different filenames but identical pixel content
+                           (detected via MD5 hash of the file).
+      3. Colour mode      — grayscale images that should be RGB/BGR.
+      4. Minimum size     — images smaller than 500x500 (too small for
+                           reliable feature extraction).
+    """
+
+    print("\nRunning quality checks...")
+    image_paths = list_image_files(input_dir)
+
+    if not image_paths:
+        print("  No images found to check.")
+        return
+
+    corrupt = []
+    grayscale_imgs = []
+    too_small = []
+    hash_map: Dict[str, str] = {}
+    duplicates = []
+
+    for path in image_paths:
+        filename = os.path.basename(path)
+
+        # 1. Corrupt file check: can OpenCV read it?
+        img = cv2.imread(path)
+        if img is None:
+            corrupt.append(filename)
+            continue
+
+        # 2. Duplicate check: MD5 hash of the raw file bytes.
+        with open(path, "rb") as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+        if file_hash in hash_map:
+            duplicates.append((filename, hash_map[file_hash]))
+        else:
+            hash_map[file_hash] = filename
+
+        # 3. Colour mode: is the image grayscale (single channel)?
+        if len(img.shape) < 3 or img.shape[2] == 1:
+            grayscale_imgs.append(filename)
+
+        # 4. Minimum resolution.
+        h, w = img.shape[:2]
+        if h < 500 or w < 500:
+            too_small.append((filename, w, h))
+
+    # Report results.
+    problems_found = False
+
+    if corrupt:
+        problems_found = True
+        print(f"\n  CORRUPT files ({len(corrupt)}) — cannot be read:")
+        for f in corrupt:
+            print(f"    - {f}")
+
+    if duplicates:
+        problems_found = True
+        print(f"\n  DUPLICATE files ({len(duplicates)}) — identical content:")
+        for dup, original in duplicates:
+            print(f"    - {dup}  is a copy of  {original}")
+
+    if grayscale_imgs:
+        problems_found = True
+        print(f"\n  GRAYSCALE images ({len(grayscale_imgs)}) — not RGB/colour:")
+        for f in grayscale_imgs:
+            print(f"    - {f}")
+
+    if too_small:
+        problems_found = True
+        print(f"\n  TOO SMALL ({len(too_small)}) — below 500x500 minimum:")
+        for f, w, h in too_small:
+            print(f"    - {f}: {w}x{h}")
+
+    if not problems_found:
+        print(f"  All {len(image_paths)} images passed quality checks.")
+    else:
+        print("\n  Review the issues above before continuing.")
 
 
 def ensure_output_folder_exists() -> None:
@@ -906,6 +944,70 @@ def adjust_saturation_from_plan(
             print(f"WARNING: Could not save saturation-adjusted image to: {save_path}")
 
 
+def adjust_sharpness_from_plan(
+    plan_df: pd.DataFrame,
+    output_dir: str,
+) -> None:
+    """
+    Adjust sharpness by applying a Gaussian blur to images that are
+    too sharp compared to the triplet mean.
+
+    - Only reduces sharpness (blur), never increases it, because
+      adding artificial sharpness creates visible artifacts.
+    - The blur kernel size controls how much sharpness is reduced.
+      A larger kernel = more blur = lower sharpness.
+    """
+
+    if plan_df is None or plan_df.empty:
+        print("\nNo adjustment plan available, skipping sharpness adjustment.")
+        return
+
+    sharp_rows = plan_df[plan_df["feature"] == "sharpness"]
+    if sharp_rows.empty:
+        print("\nNo sharpness differences in the adjustment plan, nothing to change.")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\nAdjusting sharpness for {len(sharp_rows)} images.")
+
+    for _, row in sharp_rows.iterrows():
+        filename = row["filename"]
+        current_sharp = float(row["value"])
+        target_sharp = float(row["damped_target"])
+
+        # Only blur (reduce sharpness). Increasing sharpness artificially
+        # creates visible edge artifacts, so we skip those cases.
+        if target_sharp >= current_sharp:
+            print(f"  {filename}: already at or below target, skipping.")
+            continue
+
+        image = _load_image_preferring_adjusted(filename)
+        if image is None:
+            print(f"WARNING: Could not read image for sharpness adjustment: {filename}")
+            continue
+
+        # We iteratively apply small blurs and check the Laplacian variance
+        # until we get close to the target.  This is safer than guessing a
+        # single kernel size, and keeps the blur as gentle as possible.
+        best_image = image
+        for ksize in [3, 5, 7, 9, 11, 13, 15]:
+            blurred = cv2.GaussianBlur(image, (ksize, ksize), 0)
+            gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+            new_sharp = cv2.Laplacian(gray, cv2.CV_64F).var()
+            best_image = blurred
+            if new_sharp <= target_sharp:
+                break
+
+        save_path = os.path.join(output_dir, filename)
+        success = cv2.imwrite(save_path, best_image)
+        if not success:
+            print(f"WARNING: Could not save sharpness-adjusted image to: {save_path}")
+        else:
+            print(f"  {filename}: sharpness {current_sharp:.1f} -> ~{new_sharp:.1f} "
+                  f"(target {target_sharp:.1f}, kernel {ksize}x{ksize})")
+
+
 def measure_adjusted_images(original_df: pd.DataFrame) -> None:
     """
     Re-measure all features on the adjusted images and save to a new CSV.
@@ -1021,7 +1123,7 @@ def find_best_triplets(
         print("\nNo valid triplets found.")
         return pd.DataFrame()
 
-    ranking = pd.DataFrame(results).sort_values("score").reset_index(drop=True)
+    ranking = pd.DataFrame(results)
 
     # Pre-build a quick lookup: filename -> list of outlier feature names,
     # split into adjustable vs measure-only.
@@ -1037,25 +1139,50 @@ def find_best_triplets(
             elif feat in MEASURE_ONLY_FEATURES:
                 mo_outliers_by_file.setdefault(fn, []).append(feat)
 
+    # Compute total outliers per triplet so we can sort PERFECT first.
+    def _triplet_outlier_counts(row):
+        files = [row["isolated"], row["in_use"], row["environmental"]]
+        adj = sum(len(adj_outliers_by_file.get(f, [])) for f in files)
+        mo = sum(len(mo_outliers_by_file.get(f, [])) for f in files)
+        return adj + mo
+
+    ranking["total_outliers"] = ranking.apply(_triplet_outlier_counts, axis=1)
+
+    # Sort: PERFECT (0 outliers) first, then by score within each group.
+    ranking = ranking.sort_values(
+        ["total_outliers", "score"]
+    ).reset_index(drop=True)
+
+    # All features for the comparison table.
+    all_features = ADJUSTABLE_FEATURES + MEASURE_ONLY_FEATURES
+
     print(f"\n{'=' * 60}")
     print(f"Top {min(top_n, len(ranking))} best-matching triplets")
-    print(f"(lower score = more similar across all {len(numeric_cols)} features)")
+    print(f"(PERFECT first, then sorted by similarity score)")
     print(f"{'=' * 60}")
 
     for i, row in ranking.head(top_n).iterrows():
-        print(f"\n  #{i + 1}  score = {row['score']:.2f}")
-
         triplet_files = [row["isolated"], row["in_use"], row["environmental"]]
+
+        all_adj = sum(len(adj_outliers_by_file.get(f, [])) for f in triplet_files)
+        all_mo = sum(len(mo_outliers_by_file.get(f, [])) for f in triplet_files)
+        if all_adj == 0 and all_mo == 0:
+            verdict = "PERFECT"
+        elif all_mo == 0:
+            verdict = f"GOOD ({all_adj} adjustable outlier(s))"
+        else:
+            verdict = f"OK ({all_adj} adj + {all_mo} measure-only)"
+
+        print(f"\n  #{i + 1}  score = {row['score']:.2f}  [{verdict}]")
+
         triplet_df = features_df[features_df["filename"].isin(triplet_files)]
 
-        # Build a dict: condition -> feature values (for aligned printing).
         cond_vals: Dict[str, Dict[str, float]] = {}
         for _, img_row in triplet_df.iterrows():
             cond_vals[img_row["condition"]] = {
                 f: img_row[f] for f in numeric_cols
             }
 
-        # Print image names with their outlier status.
         for cond_key, file_key in [
             ("isolated", "isolated"),
             ("in_use", "in_use"),
@@ -1068,9 +1195,9 @@ def find_best_triplets(
             if not adj_out and not mo_out:
                 status = "no outliers"
             elif adj_out and not mo_out:
-                status = f"adjustable outliers: {', '.join(adj_out)}"
+                status = f"adjustable: {', '.join(adj_out)}"
             elif mo_out and not adj_out:
-                status = f"measure-only outliers: {', '.join(mo_out)}"
+                status = f"measure-only: {', '.join(mo_out)}"
             else:
                 status = (
                     f"adjustable: {', '.join(adj_out)}; "
@@ -1079,25 +1206,13 @@ def find_best_triplets(
             print(f"    {cond_key + ':':16s} {fn}")
             print(f"      -> {status}")
 
-        # Feature comparison table (adjustable features only for clarity).
+        # Full feature comparison table (all features).
         print(f"    {'feature':>14}  {'isolated':>10}  {'in_use':>10}  {'environ.':>10}")
-        for feat in ADJUSTABLE_FEATURES:
+        for feat in all_features:
             v_iso = cond_vals.get("isolated", {}).get(feat, 0)
             v_use = cond_vals.get("in_use", {}).get(feat, 0)
             v_env = cond_vals.get("environmental", {}).get(feat, 0)
             print(f"    {feat:>14}  {v_iso:>10.1f}  {v_use:>10.1f}  {v_env:>10.1f}")
-
-        # Quick verdict for the whole triplet.
-        all_adj = sum(len(adj_outliers_by_file.get(f, [])) for f in triplet_files)
-        all_mo = sum(len(mo_outliers_by_file.get(f, [])) for f in triplet_files)
-        if all_adj == 0 and all_mo == 0:
-            verdict = "PERFECT — no outliers, ready to use as-is"
-        elif all_mo == 0:
-            verdict = f"GOOD — {all_adj} adjustable outlier(s), can be fixed"
-        else:
-            verdict = (f"OK — {all_adj} adjustable + {all_mo} measure-only "
-                       f"outlier(s), check if acceptable")
-        print(f"    >> {verdict}")
 
     return ranking
 
@@ -1109,6 +1224,11 @@ def main() -> None:
     print(f"Looking for images in: {INPUT_DIR}")
 
     ensure_output_folder_exists()
+
+    # ------------------------------------------------------------------
+    # STEP 0  Quality checks (corrupt, duplicates, grayscale, too small).
+    # ------------------------------------------------------------------
+    run_quality_checks(INPUT_DIR)
 
     # ------------------------------------------------------------------
     # STEP 1  Measure all 17 features on the original images.
@@ -1188,6 +1308,11 @@ def main() -> None:
     )
 
     adjust_saturation_from_plan(
+        plan_df=plan_df,
+        output_dir=ADJUSTED_IMAGE_DIR,
+    )
+
+    adjust_sharpness_from_plan(
         plan_df=plan_df,
         output_dir=ADJUSTED_IMAGE_DIR,
     )
