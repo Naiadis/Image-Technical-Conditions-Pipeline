@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+type: software
+title: "Image Technical Conditions Pipeline"
+authors:
+  - family-names: Enache
+    given-names: Andreea-Bianca
+    email: bianca.enache29@gmail.com
+  - family-names: Nilsson
+    given-names: Linnea Majvor Ruth
+    email: linneamrnilsson@gmail.com
+version: 1.0.0
+date-released: 2026-02-24
+repository-code: https://github.com/Naiadis/Image-tech-conditions
+keywords:
+  - image standardisation
+  - stimulus control
+  - outlier detection
+  - MAD
+  - e-commerce
